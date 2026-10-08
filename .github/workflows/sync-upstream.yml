@@ -1,0 +1,106 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # 09:00 JST
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: aws-ia/terraform-aws-control_tower_account_factory
+  BASE_BRANCH: main
+  SYNC_BRANCH: sync/upstream-main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_BRANCH }}
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream "${BASE_BRANCH}"
+
+      - name: Check for new upstream commits
+        id: check
+        run: |
+          behind=$(git rev-list --count "HEAD..upstream/${BASE_BRANCH}")
+          echo "Upstream commits not in ${BASE_BRANCH}: ${behind}"
+          echo "has_updates=$([ "${behind}" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Merge upstream into sync branch
+        id: merge
+        if: steps.check.outputs.has_updates == 'true'
+        run: |
+          git checkout -B "${SYNC_BRANCH}" "origin/${BASE_BRANCH}"
+          if git merge --no-ff -m "Merge upstream ${UPSTREAM_REPO}:${BASE_BRANCH}" "upstream/${BASE_BRANCH}"; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U > "${RUNNER_TEMP}/conflicts.txt"
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            # Commit with conflict markers so the PR branch can be resolved by hand
+            git add -A
+            git commit -m "Merge upstream ${UPSTREAM_REPO}:${BASE_BRANCH} (with conflicts)"
+          fi
+          git push --force origin "${SYNC_BRANCH}"
+
+      - name: Create or update pull request
+        if: steps.check.outputs.has_updates == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONFLICT: ${{ steps.merge.outputs.conflict }}
+        run: |
+          body_file="${RUNNER_TEMP}/pr_body.md"
+          {
+            echo "## Summary"
+            echo
+            echo "Merges the latest changes from [\`${UPSTREAM_REPO}\`](https://github.com/${UPSTREAM_REPO}) (\`${BASE_BRANCH}\`) into this fork."
+            echo
+            echo "## Upstream commits"
+            echo
+            git log --no-merges --format='- %h %s' "origin/${BASE_BRANCH}..upstream/${BASE_BRANCH}"
+            echo
+            echo "[Compare on GitHub](https://github.com/${GITHUB_REPOSITORY}/compare/${BASE_BRANCH}...${UPSTREAM_REPO%%/*}:${BASE_BRANCH})"
+            if [ "${CONFLICT}" = "true" ]; then
+              echo
+              echo "## :warning: Conflicts"
+              echo
+              echo "The merge produced conflicts. Conflict markers are committed on \`${SYNC_BRANCH}\`. Files:"
+              echo
+              sed 's/^/- `/; s/$/`/' "${RUNNER_TEMP}/conflicts.txt"
+              echo
+              echo "Resolve them on \`${SYNC_BRANCH}\`, then mark this PR ready for review and merge it promptly."
+            fi
+            echo
+            echo "> This branch is recreated from \`${BASE_BRANCH}\` and force-pushed on every run while it has pending upstream changes. Manual commits pushed here will be overwritten by the next scheduled run, so merge or close this PR before then."
+            echo
+            echo "_Created automatically by the \`Sync upstream\` workflow._"
+          } > "${body_file}"
+
+          title="Merge upstream ${UPSTREAM_REPO} (${BASE_BRANCH})"
+          pr_number=$(gh pr list --head "${SYNC_BRANCH}" --base "${BASE_BRANCH}" --state open --json number --jq '.[0].number // empty')
+
+          if [ -n "${pr_number}" ]; then
+            gh pr edit "${pr_number}" --title "${title}" --body-file "${body_file}"
+            echo "Updated PR #${pr_number}"
+          else
+            args=(--base "${BASE_BRANCH}" --head "${SYNC_BRANCH}" --title "${title}" --body-file "${body_file}")
+            if [ "${CONFLICT}" = "true" ]; then
+              args+=(--draft)
+            fi
+            gh pr create "${args[@]}"
+          fi

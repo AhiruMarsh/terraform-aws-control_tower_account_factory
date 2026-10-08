@@ -1,0 +1,11 @@
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      minor-actions-dependencies:
+        # GitHub Actions: Only group minor and patch updates (major updates are reviewed individually)
+        update-types: [minor, patch]
